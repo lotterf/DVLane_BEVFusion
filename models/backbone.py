@@ -3,50 +3,37 @@ from mmdet.models.backbones.swin import SwinTransformer
 from .bevfusion.sparse_encoder import BEVFusionSparseEncoder
 from .bevfusion.ops import Voxelization
 from .second_module import SECOND, SECONDFPN
+from mmdet.models.builder import build_backbone as build_2d_backbone, build_neck as build_2d_neck
+from mmdet3d.models.builder import build_backbone as build_3d_backbone
 
 class ImageBackbone(nn.Module):
-    def __init__(self):
+    # 接受配置字典 cfg 作为参数
+    def __init__(self, cfg):
         super().__init__()
-        self.swin = SwinTransformer(
-            embed_dims=96, depths=[2, 2, 6, 2], num_heads=[3, 6, 12, 24], window_size=7,
-            mlp_ratio=4, qkv_bias=True, drop_rate=0.0, attn_drop_rate=0.0, drop_path_rate=0.2,
-            patch_norm=True, out_indices=[1, 2, 3], with_cp=False, convert_weights=True,
-            init_cfg=dict(type='Pretrained', checkpoint='https://github.com/SwinTransformer/storage/releases/download/v1.0.0/swin_tiny_patch4_window7_224.pth')
-        )
+        # 使用 build_backbone 动态实例化，cfg 即为 fusionlane_300_baseline_lite.py 中的 encoder 配置
+        # cfg = dict(type='SwinTransformer', embed_dims=96, ...)
+        self.swin = build_2d_backbone(cfg)
+        
     def init_weights(self):
-        self.swin.init_weights()
+        # 调用通过配置实例化的模型的 init_weights 方法
+        if hasattr(self.swin, 'init_weights'):
+             self.swin.init_weights()
 
 class PointCloudBackbone(nn.Module):
-    def __init__(self):
+    # 修改为接收配置字典
+    def __init__(self, cfg):
         super().__init__()
-        voxelize_cfg = dict(
-            max_num_points=15, point_cloud_range=[-30.0, 3.0, -3.0, 30.0, 103.0, 6.0],
-            voxel_size=[0.025, 0.05, 0.225], max_voxels=[6000, 8000], voxelize_reduce=True
-        )
-        self.voxelize_reduce = voxelize_cfg.pop('voxelize_reduce')
-        self.pts_voxel_layer = Voxelization(**voxelize_cfg)
-        self.encoder = BEVFusionSparseEncoder(
-            in_channels=3, sparse_shape=[2400, 2000, 41], order=('conv', 'norm', 'act'),
-            norm_cfg=dict(type='BN1d', eps=0.001, momentum=0.01),
-            encoder_channels=((16, 16, 32), (32, 32, 64), (64, 64, 128), (128, 128)),
-            encoder_paddings=((0, 0, 1), (0, 0, 1), (0, 0, (1, 1, 0)), (0, 0)),
-            block_type='basicblock'
-        )
+        # 使用配置构建 Voxelization (pts_voxel_layer)
+        self.voxelize_reduce = cfg.voxelize_cfg.pop('voxelize_reduce')
+        self.pts_voxel_layer = Voxelization(**cfg.voxelize_cfg)
+        # 使用配置构建 Sparse Encoder (encoder)
+        self.encoder = build_3d_backbone(cfg.sparse_encoder_cfg)
 
 class SECOND_Module(nn.Module):
-    def __init__(self):
+    # 修改为接收配置字典
+    def __init__(self, cfg):
         super().__init__()
-        self.backbone = SECOND(
-        in_channels=256,
-        out_channels=[128, 256],
-        layer_nums=[5, 5],
-        layer_strides=[1, 2],
-        norm_cfg=dict(type='BN', eps=0.001, momentum=0.01),
-        conv_cfg=dict(type='Conv2d', bias=False))
-        self.neck = SECONDFPN(
-        in_channels=[128, 256],
-        out_channels=[256, 256],
-        upsample_strides=[1, 2],
-        norm_cfg=dict(type='BN', eps=0.001, momentum=0.01),
-        upsample_cfg=dict(type='deconv', bias=False),
-        use_conv_for_no_stride=True)
+        # 使用配置构建 SECOND Backbone
+        self.backbone = build_2d_backbone(cfg.second_backbone_cfg)
+        # 使用配置构建 SECOND FPN (Neck)
+        self.neck = build_2d_neck(cfg.second_neck_cfg)
