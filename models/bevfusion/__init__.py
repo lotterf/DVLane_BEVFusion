@@ -1,5 +1,6 @@
 from .bevfusion_necks import GeneralizedLSSFPN
 from .depth_lss_fusion import DepthLSSTransform, LSSTransform
+from .sparse_encoder import BEVFusionSparseEncoder
 
 __all__ = [
     'BEVFusion', 'TransFusionHead', 'ConvFuser', 'ImageAug3D', 'GridMask',
