@@ -2,18 +2,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from utils.utils import *
-from mmdet.core import multi_apply
-from mmdet.models.builder import build_loss
-from mmcv.utils import Config
-from .latr_head import LATRHead
-from .backbone import ImageBackbone, PointCloudBackbone, SECOND_Module
-from .neck import ImageNeck, ViewTransform
+# from mmdet.core import multi_apply
+# from mmdet.models.builder import build_loss
+# from mmcv.utils import Config
+# from .backbone import ImageBackbone, PointCloudBackbone, SECOND_Module
+# from .neck import ImageNeck, ViewTransform
 from .fusion import FusionLayer
-
+from mmdet.models.builder import build_backbone, build_neck
+from mmdet3d.models.builder import build_backbone as build_3d_backbone
 from .dv3dlane_head import DV3DLaneHead
+from .bevfusion.ops import Voxelization
 
-from PIL import Image
-import matplotlib.pyplot as plt
+# from PIL import Image
+# import matplotlib.pyplot as plt
 
 class LATR(nn.Module):
     def __init__(self, args):
@@ -29,15 +30,23 @@ class LATR(nn.Module):
         num_query = args.latr_cfg.num_query
         num_group = args.latr_cfg.num_group
         self.num_query = num_query
+        pts_cfg = args.pts_module_cfg
 
-        self.encoder = ImageBackbone(args.latr_cfg.encoder)
-        self.neck = ImageNeck(args.latr_cfg.neck)
-        self.view_transform = ViewTransform(args.latr_cfg.view_transform) 
-        self.encoder.init_weights() 
+        self.encoder = build_backbone(args.latr_cfg.encoder)
+        if hasattr(self.encoder, 'init_weights'):
+            self.encoder.init_weights()
+        self.neck = build_neck(args.latr_cfg.neck)
+        self.view_transform = build_neck(args.latr_cfg.view_transform)
+        
+        voxel_layer_cfg = pts_cfg.pts_voxel_layer.copy()
+        self.voxelize_reduce = voxel_layer_cfg.pop('voxelize_reduce')
+        voxel_layer_cfg.pop('type')
+        self.pts_voxel_layer = Voxelization(**voxel_layer_cfg)
 
-        self.pts_backbone = PointCloudBackbone(args.point_cloud_pipeline)
+        self.pts_encoder = build_3d_backbone(pts_cfg.pts_voxel_encoder)
+        self.pts_bev_backbone = build_backbone(pts_cfg.pts_bev_backbone)
+        self.pts_bev_neck = build_neck(pts_cfg.pts_bev_neck)
         self.fusion_layer = FusionLayer()
-        self.second_layer = SECOND_Module(args.point_cloud_pipeline) 
         self.reduce = nn.Conv2d(512, 256, 1)
 
         head_extra_cfgs = args.latr_cfg.get('head', {})
@@ -67,7 +76,7 @@ class LATR(nn.Module):
     def voxelize(self, points):
         feats, coords, sizes = [], [], []
         for k, res in enumerate(points):
-            ret = self.pts_backbone.pts_voxel_layer(res)
+            ret = self.pts_voxel_layer(res)
             f, c = ret if len(ret) == 2 else ret[:2]
             n = ret[2] if len(ret) == 3 else None
             feats.append(f)
@@ -78,17 +87,17 @@ class LATR(nn.Module):
         coords = torch.cat(coords, dim=0)
         if sizes:
             sizes = torch.cat(sizes, dim=0)
-            if self.pts_backbone.voxelize_reduce:
+            if self.voxelize_reduce:
                 feats = feats.sum(dim=1) / sizes.type_as(feats).view(-1, 1)
         return feats, coords, sizes
 
     def forward(self, image, point_cloud, _M_inv=None, is_training=True, extra_dict=None):
 
         # 图像 BEV
-        out_featList = self.encoder.swin(image)
-        neck_out = self.neck.neck(out_featList)
+        out_featList = self.encoder(image)
+        neck_out = self.neck(out_featList)
         neck_out = neck_out[0] #[2,256,45,60]
-        img_bev_out = self.view_transform.transform(
+        img_bev_out = self.view_transform(
             neck_out,
             point_cloud,
             extra_dict['lidar2img'],
@@ -99,11 +108,11 @@ class LATR(nn.Module):
         # 点云 BEV
         points = [p.squeeze(0) for p in point_cloud]
         feats, coords, sizes = self.voxelize(points) #[12000,4] [12000,3] [12000]
-        point_bev_out = self.pts_backbone.encoder(feats, coords, coords[-1, 0] + 1).permute(0,1,3,2)  #[2,256,250,300]
+        point_bev_out = self.pts_encoder(feats, coords, coords[-1, 0] + 1).permute(0,1,3,2)  #[2,256,250,300]
 
         fusion_features = self.fusion_layer.fuser([img_bev_out, point_bev_out]) #[2,256,250,300]
-        fusion_features = self.second_layer.backbone(fusion_features)
-        fusion_features = self.second_layer.neck(fusion_features)
+        fusion_features = self.pts_bev_backbone(fusion_features)
+        fusion_features = self.pts_bev_neck(fusion_features)
         fusion_features = self.reduce(fusion_features[0])
 
         extra_dict['x'] = [fusion_features]
