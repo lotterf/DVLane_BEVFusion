@@ -5,6 +5,9 @@ import torch.nn.functional as F
 from mmcv.cnn import ConvModule
 from mmengine.model import BaseModule
 
+from mmdet.models.builder import NECKS 
+
+@NECKS.register_module() 
 class GeneralizedLSSFPN(BaseModule):
 
     def __init__(
