@@ -370,8 +370,8 @@ class Runner:
                         lanelines_pred = []
                         lanelines_prob = []
 
-                    if lanelines_pred != []:
-                        print(1)
+                    # if lanelines_pred != []:
+                    #     print(1)
                     json_line["pred_laneLines"] = lanelines_pred
                     json_line["pred_laneLines_prob"] = lanelines_prob
 
