@@ -1,0 +1,25 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Distributed main.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "/home/dfz/.conda/envs/LATR/lib/python3.8/site-packages/torch/distributed/launch.py",
+            "args": [
+                "--nproc_per_node=2",
+                "${workspaceFolder}/main.py",
+                "--config", "config/release_iccv/fusionlane_300_baseline_lite.py"
+                // "--cfg-options",
+                // "evaluate=true",
+                // "eval_ckpt=work_dirs/openlane/release_iccv/fusionlane_300_baseline_lite/release_iccv/fusionlane_300_baseline_lite/model_best_epoch_21.pth.tar"
+            ],
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0,1",
+                "PYTHONPATH": "${workspaceFolder}:${env:PYTHONPATH}"
+            },
+            "console": "integratedTerminal",
+            "justMyCode": false
+        }
+    ]
+}
