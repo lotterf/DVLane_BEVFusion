@@ -30,19 +30,14 @@ class LATR(nn.Module):
         num_group = args.latr_cfg.num_group
         self.num_query = num_query
 
-        # 图像主干
-        self.encoder = ImageBackbone()
-        self.neck = ImageNeck()
-        self.view_transform = ViewTransform()
-        self.encoder.init_weights()
+        self.encoder = ImageBackbone(args.latr_cfg.encoder)
+        self.neck = ImageNeck(args.latr_cfg.neck)
+        self.view_transform = ViewTransform(args.latr_cfg.view_transform) 
+        self.encoder.init_weights() 
 
-        # 点云主干
-        self.pts_backbone = PointCloudBackbone()
-
+        self.pts_backbone = PointCloudBackbone(args.point_cloud_pipeline)
         self.fusion_layer = FusionLayer()
-
-        self.second_layer = SECOND_Module()
-
+        self.second_layer = SECOND_Module(args.point_cloud_pipeline) 
         self.reduce = nn.Conv2d(512, 256, 1)
 
         head_extra_cfgs = args.latr_cfg.get('head', {})
