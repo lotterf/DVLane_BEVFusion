@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 from .ops import bev_pool
+from mmdet.models.builder import NECKS 
 
 
 def gen_dx_bx(xbound, ybound, zbound):
@@ -302,7 +303,7 @@ class BaseDepthTransform(BaseViewTransform):
         x = self.bev_pool(geom, x)
         return x
 
-
+@NECKS.register_module()
 class DepthLSSTransform(BaseDepthTransform):
 
     def __init__(
