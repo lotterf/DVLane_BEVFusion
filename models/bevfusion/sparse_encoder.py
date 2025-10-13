@@ -8,6 +8,9 @@ if IS_SPCONV2_AVAILABLE:
 else:
     from mmcv.ops import SparseConvTensor
 
+from mmdet3d.models.builder import BACKBONES
+
+@BACKBONES.register_module()
 class BEVFusionSparseEncoder(SparseEncoder):
     r"""Sparse encoder for BEVFusion. The difference between this
     implementation and that of ``SparseEncoder`` is that the shape order of 3D
