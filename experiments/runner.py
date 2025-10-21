@@ -30,12 +30,13 @@ from mmcv.runner.optimizer import build_optimizer
 class Runner:
     def __init__(self, args):
         self.args = args
-        set_work_dir(self.args)
-        self.logger = create_logger(args)
+        # set_work_dir(self.args)
 
         save_id = args.mod
         args.save_json_path = args.save_path
         args.save_path = os.path.join(args.save_path, save_id)
+
+        self.logger = create_logger(args)
 
         # Check GPU availability
         if is_main_process():
@@ -531,13 +532,13 @@ class Runner:
     def _get_train_dataset(self):
         args = self.args
         if 'openlane' in args.dataset_name:
-            train_dataset = LaneDataset(args.dataset_dir, args.data_dir + 'training/', args, data_aug=False)
+            train_dataset = LaneDataset(args.dataset_dir, args.data_dir + 'training/', args, args.dataset_cfg.train_pipeline)
 
         elif 'once' in args.dataset_name:
-            train_dataset = LaneDataset(args.dataset_dir, ops.join(args.data_dir, 'train/'), args, data_aug=True)
+            train_dataset = LaneDataset(args.dataset_dir, ops.join(args.data_dir, 'train/'), args, args.dataset_cfg.train_pipeline)
         else:
             self.logger.info('using Apollo Dataset')
-            train_dataset = ApolloLaneDataset(args.dataset_dir, ops.join(args.data_dir, 'train.json'), args, data_aug=True)
+            train_dataset = ApolloLaneDataset(args.dataset_dir, ops.join(args.data_dir, 'train.json'), args, args.dataset_cfg.train_pipeline)
         
         train_loader, train_sampler = get_loader(train_dataset, args)
 
@@ -623,15 +624,15 @@ class Runner:
         args = self.args
         if 'openlane' in args.dataset_name:
             if not args.evaluate_case:
-                valid_dataset = LaneDataset(args.dataset_dir, args.data_dir + 'validation/', args)
+                valid_dataset = LaneDataset(args.dataset_dir, args.data_dir + 'validation/', args, args.dataset_cfg.val_pipeline)
             else:
                 # TODO eval case
-                valid_dataset = LaneDataset(args.dataset_dir, args.data_dir + 'test/up_down_case/', args)
+                valid_dataset = LaneDataset(args.dataset_dir, args.data_dir + 'test/up_down_case/', args, args.dataset_cfg.val_pipeline)
 
         elif 'once' in args.dataset_name:
-            valid_dataset = LaneDataset(args.dataset_dir, ops.join(args.data_dir, 'val/'), args)
+            valid_dataset = LaneDataset(args.dataset_dir, ops.join(args.data_dir, 'val/'), args, args.dataset_cfg.val_pipeline)
         else:
-            valid_dataset = ApolloLaneDataset(args.dataset_dir, os.path.join(args.data_dir, 'test.json'), args)
+            valid_dataset = ApolloLaneDataset(args.dataset_dir, os.path.join(args.data_dir, 'test.json'), args, args.dataset_cfg.val_pipeline)
 
         valid_loader, valid_sampler = get_loader(valid_dataset, args)
         return valid_dataset, valid_loader, valid_sampler
