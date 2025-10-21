@@ -17,6 +17,8 @@ import torchvision.transforms.functional as F
 from torchvision.transforms import InterpolationMode
 from utils.utils import *
 from experiments.gpu_utils import is_main_process
+from mmdet3d.datasets.pipelines import (PointSample, PointShuffle, Compose, PointsRangeFilter)
+from mmdet3d.core.points import LiDARPoints
 
 from .transform import PhotoMetricDistortionMultiViewImage
 from .lidar_utils import lidar2cam, cam2img, filter_fov, get_homo_coords
@@ -40,21 +42,28 @@ class LaneDataset(Dataset):
         It is assumed the dataset provides accurate visibility labels. Preparing ground-truth tensor depends on it.
     """
     # dataset_base_dir is image path, json_file_path is json file path,
-    def __init__(self, dataset_base_dir, json_file_path, args, data_aug=False):
+    def __init__(self, dataset_base_dir, json_file_path, args, pipeline=None):
         """
 
         :param dataset_info_file: json file list
         """
         self.totensor = transforms.ToTensor()
-        mean = [0.485, 0.456, 0.406] if args.mean is None else args.mean
-        std = [0.229, 0.224, 0.225] if args.std is None else args.std
+        mean =args.mean
+        std = args.std
         self.normalize = transforms.Normalize(mean, std)
-        self.data_aug = data_aug
-        if data_aug:
-            if hasattr(args, 'photo_aug'):
-                self.photo_aug = PhotoMetricDistortionMultiViewImage(**args.photo_aug)
-            else:
-                self.photo_aug = False
+
+        if pipeline is not None:
+            img_pipes = []
+            img_albu_pipe = None
+            for pipe in pipeline['img_aug']:
+                if pipe['type'] == 'Albu':
+                    img_albu_pipe = Compose([pipe])
+                else:
+                    img_pipes.append(pipe)
+            self.img_pipeline  = Compose(img_pipes)
+            self.img_albu_pipe = img_albu_pipe
+            self.pts_pipeline  = Compose(pipeline['pts_aug'])
+            self.gt3d_pipeline = Compose(pipeline['gt3d_aug'])
 
         self.seg_bev = getattr(args, 'seg_bev', False)
         self.bev_thick = getattr(args, 'bev_thick', 2)
@@ -325,8 +334,10 @@ class LaneDataset(Dataset):
                 dtype=np.uint8)
             assert points is not None
             single_points = points
-            max_v = single_points.max(axis=0)
-            min_v = single_points.min(axis=0)
+            # max_v = single_points.max(axis=0)
+            # min_v = single_points.min(axis=0)
+            max_v = single_points.max(0)[0]
+            min_v = single_points.min(0)[0]
             max_x, max_y = max_v[:2]
             min_x, min_y = min_v[:2]
             max_x_bev = (max_x - self.args.position_range[0]) / self.args.voxel_size[0]
@@ -505,20 +516,27 @@ class LaneDataset(Dataset):
         image = F.crop(image, self.h_crop, 0, self.h_org-self.h_crop, self.w_org)
         image = F.resize(image, size=(self.h_net, self.w_net), interpolation=InterpolationMode.BILINEAR)
 
-        # if self.data_aug:
-        #     img_rot, aug_mat = data_aug_rotate(image)
-        #     if self.photo_aug:
-        #         img_rot = self.photo_aug(
-        #             dict(img=img_rot.copy().astype(np.float32))
-        #         )['img']
-        #     image = Image.fromarray(
-        #         np.clip(img_rot, 0, 255).astype(np.uint8))
-        aug_mat = None
+        aug_mat = np.eye(3)
+        if hasattr(self, 'img_pipeline'):
+            if self.img_albu_pipe is not None:
+                image = self.img_albu_pipe(dict(img=np.array(image)))['img']
+
+            aug_dict = self.img_pipeline(dict(img=np.array(image)))
+            image = Image.fromarray(
+                np.clip(aug_dict['img'], 0, 255).astype(np.uint8))
+            aug_mat = aug_dict.get('rot_mat', np.eye(3))
+
         trans = self.gen_M(T_cam2gd, intrinsics, processed_info_dict, aug_mat)
         T_gd_label2img = np.eye(4).astype(np.float32)
         T_gd_label2img[:3] = trans['M']
 
         intrinsics = np.matmul(self.H_crop, intrinsics)
+
+        lidar_fov = extra_dict['point_cloud']
+        lidar_fov = self.pts_pipeline(
+                dict(points=LiDARPoints(lidar_fov, points_dim=lidar_fov.shape[1])))
+        lidar_fov = lidar_fov['points'].tensor
+        extra_dict['point_cloud'] = lidar_fov[:, :self.args.num_lidar_feat]
 
         seg_labels = self.gen_seg_labels(
             T_gd_label2img, 
@@ -548,9 +566,9 @@ class LaneDataset(Dataset):
         extra_dict['image'] = image
         extra_dict['intrinsics'] = intrinsics
         extra_dict['cam2lidar'] = T_cam2gd  # 不需调整
-        if self.data_aug:
-            aug_mat = torch.from_numpy(aug_mat.astype(np.float32))
-            extra_dict['aug_mat'] = aug_mat
+        # if self.data_aug:
+        #     aug_mat = torch.from_numpy(aug_mat.astype(np.float32))
+        #     extra_dict['aug_mat'] = aug_mat
         if self.seg_bev:
             extra_dict['bev_seg_idx_label'] = seg_labels['bev_seg_label']
             extra_dict['bev_seg_mask'] = seg_labels['bev_seg_mask']
