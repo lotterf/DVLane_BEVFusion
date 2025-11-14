@@ -6,6 +6,8 @@ _base_ = [
     '../_base_/optimizer.py'
 ]
 
+mod = 'release_iccv/fusionlane_300_baseline_lite'
+
 nepochs = 24
 eval_freq = 1
 
@@ -36,16 +38,16 @@ std = [0.229, 0.224, 0.225]
 resize_h = 360
 resize_w = 480
 
-photo_aug = dict(
-    brightness_delta=32 // 2,
-    contrast_range=(0.5, 1.5),
-    saturation_range=(0.5, 1.5),
-    hue_delta=9)
+# photo_aug = dict(
+#     brightness_delta=32 // 2,
+#     contrast_range=(0.5, 1.5),
+#     saturation_range=(0.5, 1.5),
+#     hue_delta=9)
 
 seg_bev = True
 bev_thick = 8
 front_thick = 8
-num_lidar_feat = 6
+num_lidar_feat = 3
 
 top_view_region = np.array([
     [-10, 103], [10, 103], [-10, 3], [10, 3]]) # 定义了鸟瞰图的前后左右边界
@@ -72,6 +74,108 @@ num_query = 40 # 检测查询数量
 num_pt_per_line = 20 # 每条车道线的点数
 num_category = 21 # 类别数量 (含背景)
 pos_threshold = 0.3 # F1 score 阈值
+
+albu_train_transforms = [
+    dict(
+        type='RandomBrightnessContrast', #亮度与对比度调整
+        brightness_limit=[0.1, 0.3], #随机改变亮度的范围
+        contrast_limit=[0.1, 0.3], #随机改变对比度的范围
+        p=0.2),
+    dict(
+        type='OneOf', #从其子变换中随机选择一个执行
+        transforms=[
+            dict(
+                type='RGBShift', #RGB 偏移
+                r_shift_limit=20,
+                g_shift_limit=20,
+                b_shift_limit=20,
+                p=1.),
+            dict(
+                type='HueSaturationValue', #色调、饱和度、值调整
+                hue_shift_limit=20,
+                sat_shift_limit=30,
+                val_shift_limit=20,
+                p=1.),
+        ],
+        p=0.5),
+    dict(type='PixelDropout', #像素丢弃
+        dropout_prob=0.01,  # float
+        per_channel=False,  # bool
+        drop_value=0,  # ScaleFloatType | None
+        mask_drop_value=None,  # ScaleFloatType | None
+        always_apply=None,  # bool | None
+        p=0.2,  # float
+    ),
+    dict(
+        type='OneOf',
+        transforms=[
+            dict(type='ImageCompression', quality_lower=85, quality_upper=95, p=1), #图像压缩
+            dict(type='GaussNoise', var_limit=(10.0, 50.0), p=1), #高斯噪声
+            dict(type='RandomToneCurve', #随机色调曲线
+                 scale=0.1,  # float
+                 per_channel=False,  # bool
+                 always_apply=None,  # bool | None
+                 p=1.0,),
+        ],
+        p=0.2
+    ),
+    dict(
+        type='OneOf',
+        transforms=[
+            dict(type='Blur', blur_limit=3, p=1.0), #简单模糊
+            dict(type='MedianBlur', blur_limit=3, p=1.0), #中值模糊
+            dict(type='GaussianBlur', blur_limit=7, p=1.0), #高斯模糊
+            dict(type='ZoomBlur', #缩放模糊
+                 max_factor=(1, 1.05),  # ScaleFloatType
+                 step_factor=(0.01, 0.01),  # ScaleFloatType
+                 always_apply=None,  # bool | None
+                 p=1.0),  # float)
+        ],
+        p=0.3),
+]
+
+dataset_cfg = dict(
+    train_pipeline = dict(
+        img_aug = [
+            dict(
+                type='Albu',
+                transforms=albu_train_transforms
+            ),
+            # 你可以在这里添加其他 mmdet3d 兼容的图像增强, e.g., 旋转
+            # dict(type='GlobalRotScaleTransImage', ... )
+        ],
+        pts_aug = [
+            dict(
+                type = 'PointsRangeFilter',  #点云范围过滤操作
+                point_cloud_range = [-50, 0, -5, 50, 101, 5]
+                ),
+            dict(
+                type = 'PointSample',  #点云采样操作
+                num_points = 16384, 
+                sample_range=None),
+            dict(
+                type='PointShuffle',  #点云打乱操作
+            ),
+        ],
+        gt3d_aug = [], # 3D GT 增强 (e.g., 随图像一起旋转)
+    ),
+    val_pipeline = dict(
+        img_aug = [],
+        pts_aug = [
+            dict(
+                type  = 'PointsRangeFilter',
+                point_cloud_range = [-50, 0, -5, 50, 101, 5]
+                ),
+            dict(
+                type = 'PointSample',
+                num_points = 16384, 
+                sample_range=None),
+            ],
+        gt3d_aug = []
+    ),
+    seg_bev = seg_bev,
+    num_lidar_feat = num_lidar_feat,
+)
 
 pts_module_cfg = dict(
     # Voxelization Config (pts_voxel_layer)
@@ -162,6 +266,8 @@ latr_cfg = dict(
         dbound=[3.0, 103.0, 0.5],
         downsample=2
     ),
+    fusion_layer=dict(
+        type='ConvFuser', in_channels=[80, 256], out_channels=256),
 
     pos_encoding_2d=dict(
         type='SinePositionalEncoding',
@@ -303,18 +409,3 @@ sparse_ins_decoder=Config(
         ),
         sparse_decoder_weight=5.0,
 ))
-
-resize_h = 360  # 与 image_size 匹配
-resize_w = 480
-
-nepochs = 48
-eval_freq = 1
-optimizer_cfg = dict(
-    type='AdamW',
-    lr=2e-4,
-    betas=(0.95, 0.99),
-    paramwise_cfg=dict(
-        custom_keys={
-            'sampling_offsets': dict(lr_mult=0.1),
-        }),
-    weight_decay=0.01)
