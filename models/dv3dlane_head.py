@@ -92,6 +92,7 @@ class DV3DLaneHead(nn.Module):
                  project_crit=dict(
                      type='SmoothL1Loss'),
                  share_pred_heads=True,
+                 geo_loss_weight=0.5, # [新增 1] 添加几何 Loss 权重，建议初始设为 0.5 或 1.0
                  ):
         super().__init__()
         self.args = args
@@ -130,6 +131,7 @@ class DV3DLaneHead(nn.Module):
         self.vis_loss_weight = vis_loss_weight
         self.cls_loss_weight = cls_loss_weight
         self.project_loss_weight = project_loss_weight
+        self.geo_loss_weight = geo_loss_weight # [新增 2] 保存权重
 
         loss_reg['reduction'] = 'none'
         self.reg_crit = build_loss(loss_reg)
@@ -417,17 +419,38 @@ class DV3DLaneHead(nn.Module):
 
         return all_loss / len(results)
 
+    # 修改 models/dv3dlane_head.py 的 get_loss 方法
+
     def get_loss(self, output_dict, input_dict):
         all_cls_pred = output_dict['all_cls_scores']
         all_lane_pred = output_dict['all_line_preds']
         gt_lanes = input_dict['ground_lanes']
-        all_xs_loss = 0.0
-        all_zs_loss = 0.0
-        all_vis_loss = 0.0
-        all_cls_loss = 0.0
+        
+        # 获取外参矩阵 [B, 4, 4]
+        lidar2img = input_dict['lidar2img'] 
 
         matched_indices = output_dict['matched_indices']
         num_layers = all_lane_pred.shape[0]
+
+        # [新增辅助函数] 简单的 3D 转 2D 投影函数 (保持梯度)
+        def project_3d_to_2d(points_3d, matrix):
+            # points_3d: [N, P, 3] (x, y, z)
+            # matrix: [4, 4]
+            N, P, _ = points_3d.shape
+            ones = torch.ones((N, P, 1), device=points_3d.device)
+            points_homo = torch.cat([points_3d, ones], dim=-1) # [N, P, 4]
+            
+            # 投影: (Matrix @ Point.T).T
+            # matrix: 4x4, points: NxPx4 -> transpose -> 4x(N*P)
+            points_homo_flat = points_homo.view(-1, 4).permute(1, 0) # [4, N*P]
+            uv_homo = torch.matmul(matrix, points_homo_flat) # [4, N*P]
+            uv_homo = uv_homo.permute(1, 0).view(N, P, 4) # [N, P, 4]
+            
+            # 归一化: u = x/z, v = y/z
+            # 加一个极小值 eps 防止除以 0
+            z = torch.clamp(uv_homo[..., 2:3], min=1e-5)
+            uv = uv_homo[..., :2] / z
+            return uv
 
         def single_layer_loss(layer_idx):
             gcls_pred = all_cls_pred[layer_idx]
@@ -448,9 +471,14 @@ class DV3DLaneHead(nn.Module):
             per_zs_loss = 0.0
             per_vis_loss = 0.0
             per_cls_loss = 0.0
+            per_geo_loss = 0.0 # [新增] 累计几何 Loss
+            
             batch_size = len(matched_indices[0])
 
             for b_idx in range(len(matched_indices[0])):
+                # 获取当前样本的外参
+                cur_lidar2img = lidar2img[b_idx] 
+                
                 for group_idx in range(self.num_group):
                     pred_idx = matched_indices[group_idx][b_idx][0]
                     gt_idx = matched_indices[group_idx][b_idx][1]
@@ -462,20 +490,24 @@ class DV3DLaneHead(nn.Module):
                         cls_target = cls_pred.new_zeros(cls_pred[b_idx].shape[0]).long()
                         cls_loss = self.cls_crit(cls_pred[b_idx], cls_target)
                         per_cls_loss = per_cls_loss + cls_loss
-                        # Fake loss for unused parameters bug
                         per_xs_loss = per_xs_loss + 0.0 * lane_pred[b_idx].mean()
+                        # per_geo_loss += 0.0 # 空样本不需要加
                         continue
 
                     pos_lane_pred = lane_pred[b_idx][pred_idx]
                     gt_lane = gt_lanes[b_idx][gt_idx]
 
+                    # 1. 解析预测值
                     pred_xs = pos_lane_pred[:, :self.code_size]
                     pred_zs = pos_lane_pred[:, self.code_size : 2*self.code_size]
                     pred_vis = pos_lane_pred[:, 2*self.code_size:]
+                    
+                    # 2. 解析真值
                     gt_xs = gt_lane[:, :self.code_size]
                     gt_zs = gt_lane[:, self.code_size : 2*self.code_size]
                     gt_vis = gt_lane[:, 2*self.code_size:3*self.code_size]
 
+                    # 3. 计算基础 3D Loss
                     loc_mask = gt_vis > 0
                     xs_loss = self.reg_crit(pred_xs, gt_xs)
                     zs_loss = self.reg_crit(pred_zs, gt_zs)
@@ -487,65 +519,54 @@ class DV3DLaneHead(nn.Module):
                     cls_target[pred_idx] = torch.argmax(
                         gt_lane[:, 3*self.code_size:], dim=1)
                     cls_loss = self.cls_crit(cls_pred[b_idx], cls_target)
+                    
+                    # ================= [新增核心部分: 几何一致性 Loss] =================
+                    # 构建预测的 3D 点集 (N, P, 3)
+                    # 注意: Y 坐标是固定的 anchor_y_steps
+                    ys = self.anchor_y_steps.unsqueeze(0).expand_as(pred_xs).to(pred_xs.device)
+                    pred_points_3d = torch.stack([pred_xs, ys, pred_zs], dim=-1)
+                    
+                    # 构建 GT 的 3D 点集 (N, P, 3)
+                    gt_points_3d = torch.stack([gt_xs, ys, gt_zs], dim=-1)
+                    
+                    # 将两者都投影到 2D 图像平面
+                    pred_uv = project_3d_to_2d(pred_points_3d, cur_lidar2img)
+                    gt_uv = project_3d_to_2d(gt_points_3d, cur_lidar2img)
+                    
+                    # 计算 2D 投影误差 (只计算 vis > 0 的有效点)
+                    # 使用 SmoothL1 或 L1 Loss
+                    geo_loss = F.l1_loss(pred_uv, gt_uv, reduction='none')
+                    # loc_mask 的形状通常是 [N, P] -> 扩展到 [N, P, 2] 以匹配 uv
+                    mask_uv = loc_mask.unsqueeze(-1).expand_as(geo_loss)
+                    
+                    geo_loss = (geo_loss * mask_uv).sum() / torch.clamp(mask_uv.sum(), 1)
+                    
+                    per_geo_loss += geo_loss
+                    # ===============================================================
 
                     per_xs_loss += xs_loss
                     per_zs_loss += zs_loss
                     per_vis_loss += vis_loss
                     per_cls_loss += cls_loss
 
+            # 返回时增加 geo_loss
             return tuple(map(lambda x: x / batch_size / self.num_group,
-                             [per_xs_loss, per_zs_loss, per_vis_loss, per_cls_loss]))
+                             [per_xs_loss, per_zs_loss, per_vis_loss, per_cls_loss, per_geo_loss]))
 
-        all_xs_loss, all_zs_loss, all_vis_loss, all_cls_loss = multi_apply(
+        # 解包返回值，增加了一个变量
+        all_xs_loss, all_zs_loss, all_vis_loss, all_cls_loss, all_geo_loss = multi_apply(
             single_layer_loss, range(all_lane_pred.shape[0]))
+        
         all_xs_loss = sum(all_xs_loss) / num_layers
         all_zs_loss = sum(all_zs_loss) / num_layers
         all_vis_loss = sum(all_vis_loss) / num_layers
         all_cls_loss = sum(all_cls_loss) / num_layers
+        all_geo_loss = sum(all_geo_loss) / num_layers # [新增] 平均几何 Loss
 
         return dict(
             all_xs_loss=self.xs_loss_weight * all_xs_loss,
             all_zs_loss=self.zs_loss_weight * all_zs_loss,
             all_vis_loss=self.vis_loss_weight * all_vis_loss,
             all_cls_loss=self.cls_loss_weight * all_cls_loss,
+            all_geo_loss=self.geo_loss_weight * all_geo_loss, # [新增] 返回几何 Loss
         )
-
-    # def get_3d_keypos(self, 
-    #                   points, 
-    #                   T_lidar2img, 
-    #                   img_shape, 
-    #                   pad_shape,
-    #                   img_feats,
-    #                   point_feats,
-    #                   hit_mask=None,
-    #                   pt2img_feats=None,
-    #                   mf_pt2img_feats=None,
-    #                   mf_hit_mask=None,
-    #                   x=None,
-    #                   **kwargs):
-    #     top_view_region = self.top_view_region
-    #     xmin, ymin, zmin, xmax, ymax, zmax = top_view_region
-    #     output_dict = {}
-    #     points_xyz = torch.cat([
-    #         points[..., :3],
-    #         torch.ones([*points.shape[:-1], 1],
-    #                     dtype=points.dtype,
-    #                     device=points.device)
-    #     ], dim=-1)
-    #     coords_img = ground2img(
-    #         points_xyz, *img_shape,
-    #         T_lidar2img, pad_shape,
-    #         extra_feats=None
-    #     )
-    #     ground_coords = coords_img[:, :3, ...]
-    #     ground_coords[:, 0, ...] = (ground_coords[:, 0, ...] - xmin) / (xmax - xmin)
-    #     ground_coords[:, 1, ...] = (ground_coords[:, 1, ...] - ymin) / (ymax - ymin)
-    #     ground_coords[:, 2, ...] = (ground_coords[:, 2, ...] - zmin) / (zmax - zmin)
-
-    #     ground_coords = torch.cat([
-    #         ground_coords, coords_img[:, 4:, ...]], dim=1)
-
-    #     key_pos = self.pos_encoding_3d(ground_coords)
-
-    #     output_dict.update(dict(key_pos=key_pos))
-    #     return output_dict
