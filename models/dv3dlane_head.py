@@ -324,8 +324,8 @@ class DV3DLaneHead(nn.Module):
 
         all_cls_scores = torch.stack(outputs_classes)
         cls_pred = torch.argmax(all_cls_scores[-1], dim=-1).cpu().numpy()
-        if(cls_pred.max()!=0):
-            print(1)
+        # if(cls_pred.max()!=0):
+        #     print(1)
         all_line_preds = torch.stack(outputs_coords)
         all_line_preds[..., 0] = (all_line_preds[..., 0]
             * (self.pc_range[3] - self.pc_range[0]) + self.pc_range[0])
@@ -510,42 +510,42 @@ class DV3DLaneHead(nn.Module):
             all_cls_loss=self.cls_loss_weight * all_cls_loss,
         )
 
-    def get_3d_keypos(self, 
-                      points, 
-                      T_lidar2img, 
-                      img_shape, 
-                      pad_shape,
-                      img_feats,
-                      point_feats,
-                      hit_mask=None,
-                      pt2img_feats=None,
-                      mf_pt2img_feats=None,
-                      mf_hit_mask=None,
-                      x=None,
-                      **kwargs):
-        top_view_region = self.top_view_region
-        xmin, ymin, zmin, xmax, ymax, zmax = top_view_region
-        output_dict = {}
-        points_xyz = torch.cat([
-            points[..., :3],
-            torch.ones([*points.shape[:-1], 1],
-                        dtype=points.dtype,
-                        device=points.device)
-        ], dim=-1)
-        coords_img = ground2img(
-            points_xyz, *img_shape,
-            T_lidar2img, pad_shape,
-            extra_feats=None if self.num_lidar_feat == 3 else points[..., 3:self.num_lidar_feat]
-        )
-        ground_coords = coords_img[:, :3, ...]
-        ground_coords[:, 0, ...] = (ground_coords[:, 0, ...] - xmin) / (xmax - xmin)
-        ground_coords[:, 1, ...] = (ground_coords[:, 1, ...] - ymin) / (ymax - ymin)
-        ground_coords[:, 2, ...] = (ground_coords[:, 2, ...] - zmin) / (zmax - zmin)
+    # def get_3d_keypos(self, 
+    #                   points, 
+    #                   T_lidar2img, 
+    #                   img_shape, 
+    #                   pad_shape,
+    #                   img_feats,
+    #                   point_feats,
+    #                   hit_mask=None,
+    #                   pt2img_feats=None,
+    #                   mf_pt2img_feats=None,
+    #                   mf_hit_mask=None,
+    #                   x=None,
+    #                   **kwargs):
+    #     top_view_region = self.top_view_region
+    #     xmin, ymin, zmin, xmax, ymax, zmax = top_view_region
+    #     output_dict = {}
+    #     points_xyz = torch.cat([
+    #         points[..., :3],
+    #         torch.ones([*points.shape[:-1], 1],
+    #                     dtype=points.dtype,
+    #                     device=points.device)
+    #     ], dim=-1)
+    #     coords_img = ground2img(
+    #         points_xyz, *img_shape,
+    #         T_lidar2img, pad_shape,
+    #         extra_feats=None
+    #     )
+    #     ground_coords = coords_img[:, :3, ...]
+    #     ground_coords[:, 0, ...] = (ground_coords[:, 0, ...] - xmin) / (xmax - xmin)
+    #     ground_coords[:, 1, ...] = (ground_coords[:, 1, ...] - ymin) / (ymax - ymin)
+    #     ground_coords[:, 2, ...] = (ground_coords[:, 2, ...] - zmin) / (zmax - zmin)
 
-        ground_coords = torch.cat([
-            ground_coords, coords_img[:, 4:, ...]], dim=1)
+    #     ground_coords = torch.cat([
+    #         ground_coords, coords_img[:, 4:, ...]], dim=1)
 
-        key_pos = self.pos_encoding_3d(ground_coords)
+    #     key_pos = self.pos_encoding_3d(ground_coords)
 
-        output_dict.update(dict(key_pos=key_pos))
-        return output_dict
+    #     output_dict.update(dict(key_pos=key_pos))
+    #     return output_dict
