@@ -68,6 +68,7 @@ class LATR(nn.Module):
             embed_dims=_dim_,
             transformer=args.transformer,
             sparse_ins_decoder=args.sparse_ins_decoder,
+            geo_loss_weight=1.0, #新增
             **head_extra_cfgs,
             trans_params=args.latr_cfg.get('trans_params', {})
         )
