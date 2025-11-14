@@ -1,6 +1,8 @@
 {
     "version": "0.2.0",
     "configurations": [
+        
+
         {
             "name": "Python: Distributed main.py",
             "type": "debugpy",
@@ -12,7 +14,7 @@
                 "--config", "config/release_iccv/fusionlane_300_baseline_lite.py"
                 // "--cfg-options",
                 // "evaluate=true",
-                // "eval_ckpt=work_dirs/openlane/release_iccv/fusionlane_300_baseline_lite/release_iccv/fusionlane_300_baseline_lite/model_best_epoch_21.pth.tar"
+                // "eval_ckpt=work_dirs/openlane/release_iccv/fusionlane_300_baseline_lite/model_best_epoch_21.pth.tar"
             ],
             "env": {
                 "CUDA_VISIBLE_DEVICES": "0,1",
