@@ -7,7 +7,6 @@ from utils.utils import *
 # from mmcv.utils import Config
 # from .backbone import ImageBackbone, PointCloudBackbone, SECOND_Module
 # from .neck import ImageNeck, ViewTransform
-from .fusion import FusionLayer
 from mmdet.models.builder import build_backbone, build_neck
 from mmdet3d.models.builder import build_backbone as build_3d_backbone
 from .dv3dlane_head import DV3DLaneHead
@@ -46,7 +45,7 @@ class LATR(nn.Module):
         self.pts_encoder = build_3d_backbone(pts_cfg.pts_voxel_encoder)
         self.pts_bev_backbone = build_backbone(pts_cfg.pts_bev_backbone)
         self.pts_bev_neck = build_neck(pts_cfg.pts_bev_neck)
-        self.fusion_layer = FusionLayer()
+        self.fusion_layer = build_neck(args.latr_cfg.fusion_layer)
         self.reduce = nn.Conv2d(512, 256, 1)
 
         head_extra_cfgs = args.latr_cfg.get('head', {})
@@ -110,7 +109,7 @@ class LATR(nn.Module):
         feats, coords, sizes = self.voxelize(points) #[12000,4] [12000,3] [12000]
         point_bev_out = self.pts_encoder(feats, coords, coords[-1, 0] + 1).permute(0,1,3,2)  #[2,256,250,300]
 
-        fusion_features = self.fusion_layer.fuser([img_bev_out, point_bev_out]) #[2,256,250,300]
+        fusion_features = self.fusion_layer([img_bev_out, point_bev_out]) #[2,256,250,300]
         fusion_features = self.pts_bev_backbone(fusion_features)
         fusion_features = self.pts_bev_neck(fusion_features)
         fusion_features = self.reduce(fusion_features[0])
