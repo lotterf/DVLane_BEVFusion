@@ -1,7 +1,9 @@
 from torch import nn
 from typing import List, Tuple
 import torch
+from mmdet.models.builder import NECKS 
 
+@NECKS.register_module() 
 class ConvFuser(nn.Sequential):
 
     def __init__(self, in_channels: int, out_channels: int) -> None:
@@ -16,8 +18,3 @@ class ConvFuser(nn.Sequential):
 
     def forward(self, inputs: List[torch.Tensor]) -> torch.Tensor:
         return super().forward(torch.cat(inputs, dim=1))
-
-class FusionLayer(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.fuser = ConvFuser(in_channels=[80, 256], out_channels=256)
