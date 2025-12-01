@@ -359,14 +359,15 @@ transformer=dict(
         return_intermediate=False,
         transformerlayers=dict(
             type='DV3DLaneDecoderLayer',
+            # [原有的] BEV Attention 配置
             attn_cfgs=[
                 dict(
-                    type='MultiheadAttention',
+                    type='MultiheadAttention', # Self Attention
                     embed_dims=_dim_,
                     num_heads=4,
                     dropout=0.1),
                 dict(
-                    type='MultiScaleDeformableAttention',
+                    type='MultiScaleDeformableAttention', # BEV Cross Attention
                     embed_dims=_dim_,
                     num_heads=4,
                     num_levels=1,
@@ -374,6 +375,18 @@ transformer=dict(
                     batch_first=False,
                     dropout=0.1),
                 ],
+            
+            # [新增] PV (图像) Cross Attention 配置
+            # 对应 transformer_bricks.py 中新增的 pv_attn_cfg 参数
+            pv_attn_cfg=dict(
+                type='MultiScaleDeformableAttention',
+                embed_dims=_dim_,
+                num_heads=4,
+                num_levels=2,  # 关键点：这里必须是 3，对应 latr_cfg.neck.num_outs=3
+                num_points=4,  # 每个参考点在图像上采样的点数，通常 4 或 8
+                batch_first=False,
+                dropout=0.1),
+            
             ffn_cfgs=dict(
                 type='FFN',
                 embed_dims=_dim_,
@@ -383,6 +396,7 @@ transformer=dict(
                 act_cfg=dict(type='ReLU', inplace=True),
             ),
             feedforward_channels=_dim_ * 8,
+            # operation_order 不需要改，因为我们在代码里手动把 PV Attention 加在了最后
             operation_order=('self_attn', 'norm', 'cross_attn', 'norm',
                             'ffn', 'norm')),
 ))
