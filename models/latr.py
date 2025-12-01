@@ -68,7 +68,6 @@ class LATR(nn.Module):
             embed_dims=_dim_,
             transformer=args.transformer,
             sparse_ins_decoder=args.sparse_ins_decoder,
-            geo_loss_weight=1.0, #新增
             **head_extra_cfgs,
             trans_params=args.latr_cfg.get('trans_params', {})
         )
@@ -92,13 +91,15 @@ class LATR(nn.Module):
         return feats, coords, sizes
 
     def forward(self, image, point_cloud, _M_inv=None, is_training=True, extra_dict=None):
-
         # 图像 BEV
         out_featList = self.encoder(image)
         neck_out = self.neck(out_featList)
-        neck_out = neck_out[0] #[2,256,45,60]
+        # neck_out 是一个 list [tensor1, tensor2, tensor3]
+        
+        neck_out_lss = neck_out[0] #[2,256,45,60]
+        
         img_bev_out = self.view_transform(
-            neck_out,
+            neck_out_lss,
             point_cloud,
             extra_dict['lidar2img'],
             extra_dict['intrinsics'],
@@ -116,5 +117,7 @@ class LATR(nn.Module):
         fusion_features = self.reduce(fusion_features[0])
 
         extra_dict['x'] = [fusion_features]
+        extra_dict['pv_feats'] = neck_out 
+
         output = self.head(extra_dict, is_training=is_training)
         return output
