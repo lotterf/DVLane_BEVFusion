@@ -2,7 +2,8 @@
 from typing import Tuple
 import torch
 from torch import nn
-
+import numpy as np
+from scipy.spatial import cKDTree
 from .ops import bev_pool
 from mmdet.models.builder import NECKS 
 
@@ -395,5 +396,201 @@ class DepthLSSTransform(BaseDepthTransform):
     def forward(self, *args, **kwargs):
         x = super().forward(*args, **kwargs)
         self.downsample = self.downsample.to('cuda')
+        x = self.downsample(x)
+        return x
+    
+
+@NECKS.register_module()
+class GraphDepthLSSTransform(BaseViewTransform):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        image_size: tuple,
+        feature_size: tuple,
+        xbound: tuple,
+        ybound: tuple,
+        zbound: tuple,
+        dbound: tuple,
+        downsample: int = 1,
+        K_graph: int = 8,
+        noise: bool = False
+    ) -> None:
+        super().__init__(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            image_size=image_size,
+            feature_size=feature_size,
+            xbound=xbound,
+            ybound=ybound,
+            zbound=zbound,
+            dbound=dbound,
+        )
+        self.K_graph = K_graph
+        self.noise = noise
+        self.downsample_ratio = downsample
+
+        # --- GraphBEV 特有网络层 ---
+        self.dtransform = nn.Sequential(
+            nn.Conv2d(16, 32, 5, stride=4, padding=2),
+            nn.BatchNorm2d(32),
+            nn.ReLU(True),
+            nn.Conv2d(32, 64, 5, stride=2, padding=2),
+            nn.BatchNorm2d(64),
+            nn.ReLU(True),
+        )
+        self.dtransform_Conv1 = nn.Sequential(
+            nn.Conv2d(1, 8, 1),
+            nn.BatchNorm2d(8),
+            nn.ReLU(True),
+        )
+        self.dtransform_Conv2 = nn.Sequential(
+            nn.Conv2d(self.K_graph, 8, 1),
+            nn.BatchNorm2d(8),
+            nn.ReLU(True),
+        )
+        self.depthnet = nn.Sequential(
+            nn.Conv2d(in_channels + 64, in_channels, 3, padding=1),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(True),
+            nn.Conv2d(in_channels, in_channels, 3, padding=1),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(True),
+            nn.Conv2d(in_channels, self.D + self.C, 1),
+        )
+
+        if downsample > 1:
+            assert downsample == 2, downsample
+            self.downsample = nn.Sequential(
+                nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(True),
+                nn.Conv2d(out_channels, out_channels, 3, stride=downsample, padding=1, bias=False),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(True),
+                nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(True),
+            )
+        else:
+            self.downsample = nn.Identity()
+
+    def dual_input_dtransform(self, input1, input2):
+        x1 = self.dtransform_Conv1(input1)
+        x2 = self.dtransform_Conv2(input2)
+        x = torch.cat([x1, x2], dim=1)
+        x = self.dtransform(x)
+        return x
+
+    def cKDTree_neighbor(self, masked_coords):
+        masked_coords_numpy = masked_coords.cpu().numpy()
+        kdtree = cKDTree(masked_coords_numpy)
+        # 查询 K+1 个邻居 (包含自身)
+        _, neighbor_indices = kdtree.query(masked_coords_numpy, k=self.K_graph + 1)
+        # 去掉自身 (第一列)
+        neighbor_indices = neighbor_indices[:, 1:] 
+        return torch.from_numpy(neighbor_indices).long().to(masked_coords.device)
+
+    def get_cam_feats(self, img, depth, neighbors_depth):
+        B, N, C, fH, fW = img.shape
+        
+        depth = depth.view(B * N, *depth.shape[2:]) 
+        neighbors_depth = neighbors_depth.view(B * N, *neighbors_depth.shape[2:])
+        img = img.view(B * N, C, fH, fW)
+
+        # Graph 特征提取
+        depth_feat = self.dual_input_dtransform(depth, neighbors_depth)
+        img = torch.cat([depth_feat, img], dim=1)
+        img = self.depthnet(img)
+
+        depth_prob = img[:, :self.D].softmax(dim=1)
+        context = img[:, self.D : (self.D + self.C)]
+        
+        img = depth_prob.unsqueeze(1) * context.unsqueeze(2) 
+
+        # 输出形状 [B, N, D, H, W, C]
+        img = img.view(B, N, self.C, self.D, fH, fW)
+        img = img.permute(0, 1, 3, 4, 5, 2)
+        return img
+
+    def forward(
+        self, 
+        img, 
+        points, 
+        lidar2image, 
+        camera_intrinsics, 
+        camera2lidar, 
+        metas=None, 
+        **kwargs
+    ):
+        if img.dim() == 4: img = img.unsqueeze(1)
+        
+        batch_size = len(img)
+        
+        depth = torch.zeros(batch_size, img.shape[1], 1, *self.image_size).to(points[0].device)
+        neighbors_depth = torch.zeros(batch_size, img.shape[1], self.K_graph, *self.image_size).to(points[0].device)
+
+        for b in range(batch_size):
+            cur_points = points[b]
+            cur_coords = cur_points[:, :3]
+
+            cur_lidar2image = lidar2image[b] 
+            
+            if cur_lidar2image.dim() == 3:
+                cur_lidar2image = cur_lidar2image[0]
+
+            cur_coords = cur_lidar2image[:3, :3].matmul(cur_coords.transpose(1, 0))
+            cur_coords += cur_lidar2image[:3, 3].reshape(3, 1)
+            
+            dist = cur_coords[2, :]
+            
+            cur_coords[2, :] = torch.clamp(cur_coords[2, :], 1e-5, 1e5)
+            cur_coords[:2, :] /= cur_coords[2:3, :]
+
+            cur_coords = cur_coords[:2, :].transpose(0, 1)
+            cur_coords = cur_coords[..., [1, 0]]
+
+            on_img = (
+                (cur_coords[:, 0] < self.image_size[0]) & (cur_coords[:, 0] >= 0) &
+                (cur_coords[:, 1] < self.image_size[1]) & (cur_coords[:, 1] >= 0)
+            )
+            
+            valid_mask = on_img
+            if valid_mask.sum() < self.K_graph + 1:
+                continue
+
+            masked_coords = cur_coords[valid_mask].long() 
+            masked_dist = dist[valid_mask]
+
+            depth[b, 0, 0, masked_coords[:, 0], masked_coords[:, 1]] = masked_dist
+
+            neighbor_indices = self.cKDTree_neighbor(masked_coords)
+            neighbor_dists = masked_dist[neighbor_indices] 
+            
+            for k in range(self.K_graph):
+                neighbors_depth[b, 0, k, masked_coords[:, 0], masked_coords[:, 1]] = neighbor_dists[:, k]
+
+        # -------------------------------------------------------------
+        # Geometry & BEV Pool
+        # -------------------------------------------------------------
+        
+        if camera_intrinsics.dim() == 3: camera_intrinsics = camera_intrinsics.unsqueeze(1)
+        if camera2lidar.dim() == 3: camera2lidar = camera2lidar.unsqueeze(1)
+
+        intrins = camera_intrinsics[:, 0, :3, :3]
+        camera2lidar_rots = camera2lidar[:, 0, :3, :3]
+        camera2lidar_trans = camera2lidar[:, 0, :3, 3]
+
+        geom = self.get_geometry(
+            camera2lidar_rots, 
+            camera2lidar_trans, 
+            intrins, 
+        )
+        
+        x = self.get_cam_feats(img, depth, neighbors_depth)
+        
+        x = x.squeeze(1) 
+
+        x = self.bev_pool(geom, x)
         x = self.downsample(x)
         return x
