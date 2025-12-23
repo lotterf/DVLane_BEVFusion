@@ -238,36 +238,6 @@ class DV3DLaneHead(nn.Module):
         if not isinstance(bev_feats, (list, tuple)):
             bev_feats = [bev_feats]
 
-        # [新增] 获取 PV 特征
-        pv_feats = input_dict.get('pv_feats', None)
-        pv_feat_flatten = None
-        pv_spatial_shapes = None
-        pv_level_start_index = None
-
-        if pv_feats is not None:
-            feat_flatten_list = []
-            spatial_shapes_list = []
-            # 遍历多尺度图像特征
-            for lvl, feat in enumerate(pv_feats):
-                bs, c, h, w = feat.shape
-                spatial_shape = (h, w)
-                # Flatten: [BS, C, H, W] -> [BS, H*W, C] -> [H*W, BS, C] (根据你的 Attention 实现调整维度)
-                feat = feat.flatten(2).permute(2, 0, 1).contiguous() 
-                
-                # 如果需要 Level Embedding，可以加在这里 (类似 BEV 的 self.level_embeds)
-                # feat = feat + self.pv_level_embeds[lvl].view(1, 1, -1).to(feat.device)
-                
-                spatial_shapes_list.append(spatial_shape)
-                feat_flatten_list.append(feat)
-
-            pv_feat_flatten = torch.cat(feat_flatten_list, 0)
-            pv_spatial_shapes = torch.as_tensor(
-                spatial_shapes_list, dtype=torch.long, device=bev_feats[0].device)
-            pv_level_start_index = torch.cat(
-                (pv_spatial_shapes.new_zeros((1, )),
-                 pv_spatial_shapes.prod(1).cumsum(0)[:-1])
-            )
-
         sparse_bev_output = self.sparse_ins_bev(
             bev_feats[0],
             pos_emb_3d=None,
@@ -338,9 +308,6 @@ class DV3DLaneHead(nn.Module):
                 reg_branches=self.reg_branches,
                 cls_branches=self.cls_branches,
                 img_feats=bev_feats,
-                pv_feats=pv_feat_flatten,
-                pv_spatial_shapes=pv_spatial_shapes,
-                pv_level_start_index=pv_level_start_index,
                 lidar2img=input_dict['lidar2img'],
                 pad_shape=input_dict['pad_shape'],
                 sin_embed=sin_embed,
