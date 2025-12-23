@@ -254,8 +254,9 @@ latr_cfg = dict(
         act_cfg=dict(type='ReLU', inplace=True),
         upsample_cfg=dict(mode='bilinear', align_corners=False)
     ),
+    # 1. 修改 View Transform 为 GraphDepthLSSTransform
     view_transform=dict(
-        type='DepthLSSTransform',
+        type='GraphDepthLSSTransform', # 修改类名
         in_channels=_dim_,
         out_channels=80,
         image_size=[360, 480],
@@ -264,8 +265,11 @@ latr_cfg = dict(
         ybound=[3.0, 103.0, 0.2],
         zbound=[-3.0, 6.0, 9.0],
         dbound=[3.0, 103.0, 0.5],
-        downsample=2
+        downsample=2,
+        K_graph=8,       # [新增] 图节点邻居数
+        noise=False      # [新增] 仅在专门的鲁棒性训练时开启
     ),
+    
     fusion_layer=dict(
         type='ConvFuser', in_channels=[80, 256], out_channels=256),
 
@@ -374,19 +378,7 @@ transformer=dict(
                     num_points=8,
                     batch_first=False,
                     dropout=0.1),
-                ],
-            
-            # [新增] PV (图像) Cross Attention 配置
-            # 对应 transformer_bricks.py 中新增的 pv_attn_cfg 参数
-            pv_attn_cfg=dict(
-                type='MultiScaleDeformableAttention',
-                embed_dims=_dim_,
-                num_heads=4,
-                num_levels=2,  # 关键点：这里必须是 3，对应 latr_cfg.neck.num_outs=3
-                num_points=4,  # 每个参考点在图像上采样的点数，通常 4 或 8
-                batch_first=False,
-                dropout=0.1),
-            
+                ],           
             ffn_cfgs=dict(
                 type='FFN',
                 embed_dims=_dim_,
@@ -396,7 +388,6 @@ transformer=dict(
                 act_cfg=dict(type='ReLU', inplace=True),
             ),
             feedforward_channels=_dim_ * 8,
-            # operation_order 不需要改，因为我们在代码里手动把 PV Attention 加在了最后
             operation_order=('self_attn', 'norm', 'cross_attn', 'norm',
                             'ffn', 'norm')),
 ))
