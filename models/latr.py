@@ -117,7 +117,5 @@ class LATR(nn.Module):
         fusion_features = self.reduce(fusion_features[0])
 
         extra_dict['x'] = [fusion_features]
-        extra_dict['pv_feats'] = neck_out 
-
         output = self.head(extra_dict, is_training=is_training)
         return output
