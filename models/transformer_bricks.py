@@ -48,6 +48,7 @@ def generate_ref_pt(minx, miny, maxx, maxy, z, nx, ny, device='cuda'):
     return ref_3d
 
 
+
 @TRANSFORMER_LAYER.register_module()
 class DV3DLaneDecoderLayer(BaseTransformerLayer):
     def __init__(self,
@@ -58,7 +59,6 @@ class DV3DLaneDecoderLayer(BaseTransformerLayer):
                  act_cfg=dict(type='ReLU', inplace=True),
                  norm_cfg=dict(type='LN'),
                  ffn_num_fcs=2,
-                 pv_attn_cfg=None, # [新增] PV Attention 配置
                  **kwargs):
         super().__init__(
             attn_cfgs=attn_cfgs,
@@ -72,12 +72,6 @@ class DV3DLaneDecoderLayer(BaseTransformerLayer):
         assert len(operation_order) == 6
         assert set(operation_order) == set(
             ['self_attn', 'norm', 'cross_attn', 'ffn'])
-        
-        # [新增] 初始化 PV Cross Attention
-        self.pv_attn_cfg = pv_attn_cfg
-        if pv_attn_cfg is not None:
-            self.cross_attn_pv = build_attention(pv_attn_cfg)
-            self.norm_pv = build_norm_layer(norm_cfg, self.embed_dims)[1]
 
     def forward(self,
                 query,
@@ -88,44 +82,12 @@ class DV3DLaneDecoderLayer(BaseTransformerLayer):
                 attn_masks=None,
                 query_key_padding_mask=None,
                 key_padding_mask=None,
-                pv_feats=None,             # [新增]
-                pv_reference_points=None,  # [新增]
-                pv_spatial_shapes=None,    # [新增]
-                pv_level_start_index=None, # [新增]
                 **kwargs):
-        
-        # 1. 原始 BEV 流程 (Self Attn -> Cross Attn BEV -> FFN)
-        # kwargs 中包含了 BEV 需要的 reference_points, spatial_shapes 等
         query = super().forward(
             query=query, key=key, value=value,
             query_pos=query_pos, key_pos=key_pos,
             attn_masks=attn_masks, query_key_padding_mask=query_key_padding_mask,
             key_padding_mask=key_padding_mask, **kwargs)
-        
-        # 2. [新增] PV Cross-View Interaction
-        if self.pv_attn_cfg is not None and pv_feats is not None:
-            identity = query
-            if pv_reference_points is not None:
-                # [修复] 创建专用的 kwargs，移除与 BEV 相关的参数，避免冲突
-                pv_kwargs = kwargs.copy()
-                keys_to_pop = ['reference_points', 'spatial_shapes', 'level_start_index']
-                for k in keys_to_pop:
-                    if k in pv_kwargs:
-                        pv_kwargs.pop(k)
-                
-                query = self.cross_attn_pv(
-                    query=query,
-                    key=None, # Deformable Attn 不需要 Key
-                    value=pv_feats,
-                    identity=identity,
-                    query_pos=query_pos,
-                    reference_points=pv_reference_points, # 投影后的 2D 参考点
-                    spatial_shapes=pv_spatial_shapes,
-                    level_start_index=pv_level_start_index,
-                    **pv_kwargs 
-                )
-                query = self.norm_pv(query)
-            
         return query
 
 
@@ -192,7 +154,6 @@ class DV3DLaneTransformerDecoder(TransformerLayerSequence):
                 sin_embed=None, reference_points=None,
                 reg_branches=None, cls_branches=None,
                 query_pos=None, points=None,
-                pv_feats=None, pv_spatial_shapes=None, pv_level_start_index=None, # [新增]
                 **kwargs):
         assert key_padding_mask is None
 
@@ -219,98 +180,14 @@ class DV3DLaneTransformerDecoder(TransformerLayerSequence):
         last_reference_points = [reference_points]
 
         for layer_idx, layer in enumerate(self.layers):
-            
-            # [新增] 投影逻辑: 3D Query Points -> 2D Image Plane
-            pv_reference_points = None
-            if pv_feats is not None and lidar2img is not None:
-                # [修复] 处理 reference_points 形状不一致问题
-                if reference_points.dim() == 3:
-                    # Initial state: [BS, Num_Query, Num_Anchor * Num_Pts * 2] -> Reshape to 5D for calculation
-                    ref_pts_reshaped = reference_points.view(
-                        B, self.num_query, self.num_anchor_per_query,
-                        self.num_points_per_anchor, 2
-                    )
-                else:
-                    # Already reshaped in previous iteration
-                    ref_pts_reshaped = reference_points
-
-                # 开始计算投影
-                # ref_pts_reshaped: [BS, N_Query, N_Anchor, N_Pts, 2]
-                bs, n_query, n_anchor, n_pts, _ = ref_pts_reshaped.shape
-                
-                # Flatten 用于批量投影: [BS, N*A*P, 2]
-                ref_pts_flat = ref_pts_reshaped.view(bs, -1, 2) 
-                
-                # 1. 恢复到真实世界坐标
-                x_real = ref_pts_flat[..., 0] * (xmax - xmin) + xmin
-                y_real = ref_pts_flat[..., 1] * (ymax - ymin) + ymin
-                z_real = torch.full_like(x_real, init_z) 
-                
-                points_3d = torch.stack([x_real, y_real, z_real], dim=-1) # [BS, M, 3]
-                ones = torch.ones_like(x_real).unsqueeze(-1)
-                points_homo = torch.cat([points_3d, ones], dim=-1) # [BS, M, 4]
-                
-                # 2. 投影到图像平面 (lidar2img @ points)
-                points_cam = torch.bmm(lidar2img, points_homo.permute(0, 2, 1)).permute(0, 2, 1) # [BS, M, 4]
-                
-                z_cam = torch.clamp(points_cam[..., 2:3], min=1e-5)
-                u = points_cam[..., 0:1] / z_cam
-                v = points_cam[..., 1:2] / z_cam
-                
-                # 3. 归一化到 [0, 1]
-                # [修复] 鲁棒地解析 pad_shape，兼容 Tensor (B, 2)、List[Tensor]、List[List] 等情况
-                img_shape = None
-                
-                if isinstance(pad_shape, list):
-                    img_shape = pad_shape[0]
-                elif isinstance(pad_shape, torch.Tensor):
-                     if pad_shape.dim() == 2: # (Batch, 3) or (Batch, 2)
-                         img_shape = pad_shape[0]
-                     else:
-                         img_shape = pad_shape
-
-                if isinstance(img_shape, torch.Tensor):
-                    if img_shape.dim() == 2 and img_shape.shape[0] == 1:
-                        H_img = img_shape[0][0]
-                        W_img = img_shape[0][1]
-                    elif img_shape.dim() == 1 and img_shape.shape[0] >= 2:
-                        H_img = img_shape[0]
-                        W_img = img_shape[1]
-                    else:
-                        H_img = img_shape[0]
-                        W_img = img_shape[1] if img_shape.numel() > 1 else H_img
-                else: # Tuple or List
-                    H_img = img_shape[0]
-                    W_img = img_shape[1]
-                
-                u_norm = u / W_img
-                v_norm = v / H_img
-                
-                pv_ref_raw = torch.cat([u_norm, v_norm], dim=-1) # [BS, M, 2]
-                
-                # 4. [关键修复] 不要取均值，直接保留 M=800 个点
-                # pv_ref_raw shape: [BS, M, 2]
-                
-                num_pv_levels = len(pv_spatial_shapes) if pv_spatial_shapes is not None else 1
-                
-                # 直接增加 Level 维度并扩展: [BS, M, 2] -> [BS, M, 1, 2] -> [BS, M, Levels, 2]
-                pv_reference_points = pv_ref_raw.unsqueeze(2).expand(-1, -1, num_pv_levels, -1)
-                
-                # 确保在 [0, 1] 范围内
-                pv_reference_points = torch.clamp(pv_reference_points, 0, 1)
-
             query = layer(query, key=key, value=value,
                           key_pos=sin_embed,
-                          reference_points=reference_points, # 传给 Layer 原始形状
+                          reference_points=reference_points,
                           pc_range=[xmin, ymin, zmin, xmax, ymax, zmax],
                           pad_shape=pad_shape,
                           lidar2img=lidar2img,
                           query_pos=query_pos,
                           layer_idx=layer_idx,
-                          pv_feats=pv_feats,             # [传递]
-                          pv_reference_points=pv_reference_points, # [传递计算好的 2D 参考点]
-                          pv_spatial_shapes=pv_spatial_shapes,     # [传递]
-                          pv_level_start_index=pv_level_start_index, # [传递]
                           **kwargs)
 
             if self.return_intermediate:
@@ -430,7 +307,6 @@ class DV3DLaneTransformer(BaseModule):
                 mlvl_positional_encodings=None,
                 pos_embed2d=None,
                 key_pos=None,
-                pv_feats=None, pv_spatial_shapes=None, pv_level_start_index=None, # [新增]
                 **kwargs):
         # assert pos_embed is None
         memory = x
@@ -478,9 +354,6 @@ class DV3DLaneTransformer(BaseModule):
                 reference_points=reference_points,
                 spatial_shapes=spatial_shapes,
                 level_start_index=level_start_index,
-                pv_feats=pv_feats,                         # [新增]
-                pv_spatial_shapes=pv_spatial_shapes,       # [新增]
-                pv_level_start_index=pv_level_start_index, # [新增]
                 **kwargs
             )
         return out_dec, project_results, \
