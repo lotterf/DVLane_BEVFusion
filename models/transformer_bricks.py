@@ -195,42 +195,117 @@ class DV3DLaneTransformerDecoder(TransformerLayerSequence):
                     intermediate.append(self.post_norm(query))
                 else:
                     intermediate.append(query)
-            query = query.permute(1, 0, 2).contiguous()
-            tmp = reg_branches[layer_idx](query)
-
-            bs = tmp.shape[0]
             # iterative update
-            tmp = tmp.view(bs, self.num_query,
-                self.num_anchor_per_query, -1, 3)
+            # tmp = tmp.view(bs, self.num_query,
+            #     self.num_anchor_per_query, -1, 3)
 
+            # reference_points = reference_points.view(
+            #     bs, self.num_query, self.num_anchor_per_query,
+            #     self.num_points_per_anchor, 2
+            # )
+            # reference_points = inverse_sigmoid(reference_points)
+            # new_reference_points = torch.stack([
+            #     reference_points[..., 0] + tmp[..., 0],
+            #     reference_points[..., 1] + tmp[..., 1],
+            # ], dim=-1)
+            # new_reference_points = new_reference_points.sigmoid()
+
+            # # detrex DINO vs deform-detr
+            # reference_points = new_reference_points.detach()
+            # last_reference_not_detach = inverse_sigmoid(
+            #     last_reference_points[-1]).view(
+            #         bs, self.num_query, self.num_anchor_per_query,
+            #         self.num_points_per_anchor, 2
+            #     )
+            # lftwice_refpts = torch.stack([
+            #     last_reference_not_detach[..., 0] + tmp[..., 0],
+            #     last_reference_not_detach[..., 1] + tmp[..., 1],
+            # ], dim=-1).sigmoid()
+
+            # outputs_coords.append(
+            #     torch.cat([
+            #         lftwice_refpts,
+            #         tmp[..., -1:]], dim=-1))
+            # last_reference_points.append(new_reference_points)
+
+            # cls_feat = query.view(
+            #     bs, self.num_query, self.num_anchor_per_query, -1)
+            # cls_feat = torch.max(cls_feat, dim=2)[0]
+            # outputs_class = cls_branches[layer_idx](cls_feat)
+
+            # outputs_classes.append(outputs_class)
+            # query = query.permute(1, 0, 2).contiguous()
+
+            # --- 【开始修改的部分】 ---
+            query = query.permute(1, 0, 2).contiguous()        
+            # 1. 获取预测值 [dx, z, vis]
+            tmp = reg_branches[layer_idx](query)
+            bs = tmp.shape[0]
+            tmp = tmp.view(bs, self.num_query, self.num_anchor_per_query, -1, 3)
+
+            pred_dx = tmp[..., 0]
+            pred_z  = tmp[..., 1] # 预测的 Z
+            pred_vis = tmp[..., 2]
+
+            # 2. 准备下一层的输入 (reference_points)
+            # 这一步是为了下一层 Attention 采样，通常需要 detach 梯度
+            # 逻辑：只更新 X，锁定 Y (Fixed Y Anchor)
             reference_points = reference_points.view(
                 bs, self.num_query, self.num_anchor_per_query,
                 self.num_points_per_anchor, 2
             )
-            reference_points = inverse_sigmoid(reference_points)
-            new_reference_points = torch.stack([
-                reference_points[..., 0] + tmp[..., 0],
-                reference_points[..., 1] + tmp[..., 1],
-            ], dim=-1)
-            new_reference_points = new_reference_points.sigmoid()
+            # inverse sigmoid
+            ref_inv = inverse_sigmoid(reference_points)
+            
+            # 计算 new_reference_points (用于传递给下一层)
+            # 注意：这里 Y 保持不变
+            new_ref_x = (ref_inv[..., 0] + pred_dx).sigmoid()
+            new_ref_y = reference_points[..., 1] 
+            
+            new_reference_points = torch.stack([new_ref_x, new_ref_y], dim=-1)
 
-            # detrex DINO vs deform-detr
-            reference_points = new_reference_points.detach()
-            last_reference_not_detach = inverse_sigmoid(
+            # 3. 【关键修复】保留 lftwice 逻辑 (Gradient Flow) 但修复计算公式
+            # 获取带有梯度的上一轮参考点
+            last_ref_with_grad = inverse_sigmoid(
                 last_reference_points[-1]).view(
                     bs, self.num_query, self.num_anchor_per_query,
                     self.num_points_per_anchor, 2
                 )
-            lftwice_refpts = torch.stack([
-                last_reference_not_detach[..., 0] + tmp[..., 0],
-                last_reference_not_detach[..., 1] + tmp[..., 1],
-            ], dim=-1).sigmoid()
+            
+            # 使用带有梯度的历史参考点来计算当前输出 (为了 Loss 回传)
+            # 公式：Out_X = Last_X(with_grad) + dx
+            # 公式：Out_Z = pred_z (直接预测，不依赖参考点Y)
+            lftwice_x = (last_ref_with_grad[..., 0] + pred_dx).sigmoid()
+            # lftwice_z = pred_z.sigmoid() # Z 直接使用预测值
 
-            outputs_coords.append(
-                torch.cat([
-                    lftwice_refpts,
-                    tmp[..., -1:]], dim=-1))
-            last_reference_points.append(new_reference_points)
+            # 4. 组装输出 (X, Z, Vis) 给 Head 计算 Loss
+            output_coord = torch.stack([
+                lftwice_x,          # X (带有历史梯度)
+                pred_z.sigmoid(),   # Z (直接预测)
+                pred_vis            # Vis
+            ], dim=-1)
+
+            outputs_coords.append(output_coord)
+            
+            # 5. 更新状态
+            # 注意：append 进去的是包含梯度的 new_reference_points (基于当前 tmp 计算的)
+            # 这里的 new_reference_points 虽然由 tmp 计算而来，但在下一轮循环开始前会被 detach
+            # 但存入 list 的是为了给再下一轮 lftwice 使用，所以要存
+            # 修正：这里 new_reference_points 应该是基于 ref_inv (detached) 计算的
+            # 为了 lftwice 链条不断，我们需要存一个 "attached" 版本吗？
+            # 原代码逻辑中：last_reference_points[-1] 是上一轮存入的。
+            # 我们需要构造一个 "attached" 的版本存入 list
+            
+            # 构造用于历史记录的 attached 版本 (基于上一轮 attached + 当前预测)
+            next_ref_x_attached = (last_ref_with_grad[..., 0] + pred_dx).sigmoid()
+            next_ref_y_attached = reference_points[..., 1] # Y 不变
+            
+            ref_to_save = torch.stack([next_ref_x_attached, next_ref_y_attached], dim=-1)
+            last_reference_points.append(ref_to_save)
+
+            # 准备下一层循环的输入 (必须 detach)
+            reference_points = new_reference_points.detach()
+            # --- 【修改结束】 ---
 
             cls_feat = query.view(
                 bs, self.num_query, self.num_anchor_per_query, -1)
